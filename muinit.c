@@ -8,15 +8,24 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-static const int signals_to_handle[] = {SIGALRM, SIGINT, SIGQUIT, SIGTERM};
 static struct {
-    pid_t* children;
-    int children_count;
-    int children_alive;
-    int watch_all_children;
+    char* proc_children_path;
     int termination_stage;
     int timeout;
+    int* termination_signals;
+    int termination_signals_count;
+    sigset_t set;
 } conf;
+
+static int debug(char* args, ...);
+static void print_usage(const char* name, int show_full_help);
+static int read_signals_array(char* s, int* count, int** signals);
+static int register_signal_handler(int sig);
+static void send_signal_to_children(int sig);
+static void signal_handler(int sig);
+static void spawn(char* const args[]);
+static int spawn_children(char* argv[]);
+static void terminate_children();
 
 static int debug(char* args, ...) {
 #ifdef DEBUG
@@ -31,58 +40,148 @@ static int debug(char* args, ...) {
 #endif
 }
 
-static void send_signal_to_children(int sig, int use_groups) {
-    debug("sending signal %d to children: %s\n", sig, strsignal(sig));
-    for (int i = 0; i < conf.children_count; ++i) {
-        if (conf.children[i] >= 0 || use_groups) {
-            kill(use_groups && conf.children[i] > 0 ? -conf.children[i] : conf.children[i], sig);
-        }
+static void print_usage(const char* name, int show_full_help) {
+    if (show_full_help) {
+        printf(
+            "muinit -- lightweight subprocess supervisor\n"
+            "           - minimal 'init', e.g. for docker containers\n"
+            "           - forwards signals to subprocesses\n"
+            "           - reaps zombie subprocesses\n"
+            "           - gracefully terminates all subprocesses after one exited\n"
+            "\n");
+    }
+
+    printf(
+        "Usage:\n"
+        "  %s [OPTIONS] --- COMMANDS\n"
+        "\n"
+        "OPTIONS\n"
+        "  -h           show help message\n"
+        "  -k SIGNALS   signals to iterate over in subprocess termination\n"
+        "               (comma-separated list of their numbers)\n"
+        "               default: SIGTERM,SIGKILL\n"
+        "  -s SIGNALS   signals to forward to subprocesses (comma-separated numbers)\n"
+        "               default: SIGINT\n"
+        "  -t TIMEOUT   set subprocess termination stage timeout in seconds\n"
+        "               default: 2s\n",
+        name);
+
+    if (show_full_help) {
+        printf(
+            "\n"
+            "COMMANDS\n"
+            "     Subprocesses to be spawned and their arguments are given after the\n"
+            "     first '---' and are separated by '---' (do not include quotation marks).\n"
+            "     Though muinit emulates an init session, try not to have subprocesses go\n"
+            "     into background ('daemonize') if possible.\n"
+            "\n"
+            "SIGNAL FORWARDING\n"
+            "     Signals given via the `-s' option (and that can be caught) are forwarded\n"
+            "     to subprocesses. Special cases are SIGALRM, which is used by muinit itself,\n"
+            "     and SIGTERM, which resets the termination steps and is then forwarded.\n"
+            "     The SIGNALS option values must be lists of comma-separated numbers of the\n"
+            "     signals (run `kill -L' to see a list)\n"
+            "\n"
+            "SUBPROCESS TERMINATION\n"
+            "     Once a subprocess terminates (failing or successfully), muinit tries to\n"
+            "     gracefully terminate the other subprocesses. This is done in several\n"
+            "     successive steps until all children have terminated. The steps are defined\n"
+            "     by the signal send in each respective step as given via the `-k' option\n"
+            "     (default: SIGTERM,SIGKILL). The timeout to wait after each step before\n"
+            "     trying the next one can be given via the `-t' option (default: 2s)\n"
+            "\n"
+            "EXIT STATUS\n"
+            "    Internal errors cause an exit status of 1. Otherwise the exit status equals\n"
+            "    that of the first failed subprocess or 0 if all subprocesses succeed.\n");
     }
 }
 
-static void terminate_children(int stage) {
-    if (conf.termination_stage > stage) {
-        return;
+static int read_signals_array(char* s, int* count, int** signals) { /* reads a comma-separated list of signal numbers from string */
+    if (!s || s[0] == '\0') {
+        fprintf(stderr, "no signals given\n");
+        return 1;
     }
-    switch (conf.termination_stage) {
-        case 0:
-            debug("terminating children (try 1: SIGTERM to original children)\n");
-            alarm(conf.timeout);
-            send_signal_to_children(SIGTERM, 0);
-            break;
-        case 1:
-            debug("terminating children (try 2: SIGTERM to original children groups)\n");
-            alarm(conf.timeout);
-            send_signal_to_children(SIGTERM, 1);
-            break;
-        case 2:
-            debug("terminating children (try 3: SIGKILL to original children)\n");
-            alarm(conf.timeout);
-            send_signal_to_children(SIGKILL, 0);
-            break;
-        case 3:
-            debug("terminating children (try 4: SIGKILL to original children groups)\n");
-            alarm(conf.timeout);
-            send_signal_to_children(SIGKILL, 1);
-            break;
-        default:
-            fprintf(stderr, "not all children terminated in time, exiting\n");
-            exit(1);
+    long val;
+    char* buf = s;
+    char* next = buf;
+    while (next[0] != '\0') {
+        val = strtol(buf, &next, 10);
+        if (next == buf || (next[0] != ',' && next[0] != '\0')) {
+            fprintf(stderr, "unexpected value in %s\n", s);
+            return 1;
+        }
+        if (val < 0 || val > SIGRTMAX) {
+            fprintf(stderr, "invalid signal number %ld\n", val);
+            return 1;
+        }
+        ++(*count);
+        *signals = realloc(*signals, (*count) * sizeof(int));
+        if (!(*signals)) {
+            fprintf(stderr, "can't allocate memory: %m\n");
+            return 1;
+        }
+        (*signals)[(*count) - 1] = val;
+        if (next[0] == ',') {
+            ++next;
+        }
+        buf = next;
     }
-    ++conf.termination_stage;
+    return 0;
+}
+
+static int register_signal_handler(int sig) {
+    if (signal(sig, signal_handler) == SIG_ERR) {
+        fprintf(stderr, "registering signal %d failed: %m\n", sig);
+        return 1;
+    }
+    return 0;
+}
+
+static void send_signal_to_children(int sig) {
+    sigprocmask(SIG_BLOCK, &conf.set, 0);
+
+    FILE* f = fopen(conf.proc_children_path, "r");
+    if (!f) {
+        fprintf(stderr, "can't open `%s': %m\n", conf.proc_children_path);
+        exit(1);
+    }
+
+    pid_t pid;
+    int n;
+    while (1) {
+        n = fscanf(f, "%d", &pid);
+        if (n != 1) {
+            if (errno != 0) {
+                fprintf(stderr, "fscanf on `%s' failed: %m\n", conf.proc_children_path);
+            } else if (n != EOF) {
+                fprintf(stderr, "unexpected value in `%s'\n", conf.proc_children_path);
+            }
+            break;
+        }
+        if (pid > 0) {
+            debug("sending signal %d to child %d\n", sig, pid);
+            kill(pid, sig);
+        }
+    }
+
+    fclose(f);
+
+    sigprocmask(SIG_UNBLOCK, &conf.set, 0);
 }
 
 static void signal_handler(int sig) {
-    debug("received signal %d: %s\n", sig, strsignal(sig));
+    debug("received signal %d\n", sig);
     switch (sig) {
         case SIGALRM:
-            terminate_children(1000);
+            terminate_children();
             break;
         case SIGTERM:
-            terminate_children(2);
+            alarm(0);
+            conf.termination_stage = 0;
+            terminate_children();
             break;
         default:
-            send_signal_to_children(sig, 0);
+            send_signal_to_children(sig);
             break;
     }
 }
@@ -102,72 +201,46 @@ static void spawn(char* const args[]) {
     }
     if (pid == 0) {
         setpgid(0, 0);
-        sigset_t set;
-        sigfillset(&set);
-        sigprocmask(SIG_UNBLOCK, &set, 0);
+        sigprocmask(SIG_UNBLOCK, &conf.set, 0);
         execvp(args[0], args);
         fprintf(stderr, "execvp %s failed: %m\n", args[0]);
         exit(1);
     }
-    debug("child pid: %d\n", pid);
-    ++conf.children_count;
-    ++conf.children_alive;
-    conf.children = realloc(conf.children, conf.children_count * sizeof(conf.children[0]));
-    if (!conf.children) {
-        fprintf(stderr, "realloc failed: %m\n");
-        exit(1);
-    }
-    conf.children[conf.children_count - 1] = pid;
+    debug("child spawned: %d\n", pid);
 }
 
-static void spawn_children(int argc, char* argv[]) {
-    int last_i = 0;
+static int spawn_children(char* argv[]) {
     char* tmp;
-    for (int i = 0; i < argc; ++i) {
+    char** child_argv = argv;
+    int spawn_count = 0;
+    for (int i = 0; argv[i]; ++i) {
         tmp = argv[i];
         if (tmp[0] == '-' && tmp[1] == '-' && tmp[2] == '-' && tmp[3] == '\0') {
-            argv[i] = NULL;
-            spawn(&argv[last_i]);
-            argv[i] = tmp;
-            last_i = i + 1;
+            if (child_argv != argv + i) {
+                argv[i] = NULL;
+                ++spawn_count;
+                spawn(child_argv);
+                argv[i] = tmp;
+            }
+            child_argv = argv + i + 1;
         }
     }
-    if (last_i < argc) {
-        spawn(&argv[last_i]);
+    if (child_argv[0]) {
+        ++spawn_count;
+        spawn(child_argv);
     }
+    return spawn_count;
 }
 
-static void print_usage(const char* name) {
-    printf(
-        "Usage:\n"
-        "  %s [OPTIONS] --- COMMANDS\n"
-        "\n"
-        "OPTIONS\n"
-        "  -a           also exit when subprocesses terminate that have not been spawned\n"
-        "               by muinit directly\n"
-        "  -h           show this help message\n"
-        "  -t TIMEOUT   set subprocess termination timeout in seconds (default: 2)\n"
-        "\n"
-        "COMMANDS\n"
-        "     Subprocesses to be spawned and their arguments are given after the\n"
-        "     first '---' and are separated by '---' (do not include quotation marks).\n"
-        "     Though muinit emulates an init session, try not to have subprocesses go\n"
-        "     into background ('daemonize') if possible.\n"
-        "\n"
-        "SUBPROCESS TERMINATION\n"
-        "     Once a subprocess terminates (failing or successfully, either only\n"
-        "     'original' subprocesses that were spawned by muinit directly or any\n"
-        "     subprocess when the -a parameter is set), muinit tries to gracefully\n"
-        "     terminate the other subprocesses. This is done in several successive\n"
-        "     steps until all children have terminated:\n"
-        "       1. Send SIGTERM signal to original subprocesses\n"
-        "       2. Send SIGTERM signal to original subprocesses' process groups\n"
-        "       3. Send SIGKILL signal to original subprocesses\n"
-        "       4. Send SIGKILL signal to original subprocesses' process groups\n"
-        "       5. Terminating muinit itself\n"
-        "     After each step, muinit waits for TIMEOUT seconds (default: 2) before\n"
-        "     trying the next termination step.\n",
-        name);
+static void terminate_children() {
+    if (conf.termination_stage >= conf.termination_signals_count) {
+        fprintf(stderr, "not all children terminated in time, exiting\n");
+        exit(1);
+    }
+    debug("terminating children (try %d/%d)\n", conf.termination_stage + 1, conf.termination_signals_count);
+    alarm(conf.timeout);
+    send_signal_to_children(conf.termination_signals[conf.termination_stage]);
+    ++conf.termination_stage;
 }
 
 int main(int argc, char* argv[]) {
@@ -184,64 +257,154 @@ int main(int argc, char* argv[]) {
 
     setsid();
 
-    conf.children = NULL;
-    conf.children_count = 0;
+    conf.proc_children_path = NULL;
+    conf.termination_signals = NULL;
+    conf.termination_signals_count = 0;
     conf.termination_stage = 0;
     conf.timeout = 2;
-    conf.watch_all_children = 0;
+    sigfillset(&conf.set);
 
-    for (unsigned int i = 0; i < sizeof(signals_to_handle) / sizeof(signals_to_handle[0]); ++i) {
-        int sig = signals_to_handle[i];
-        if (signal(sig, signal_handler) == SIG_ERR) {
-            fprintf(stderr, "registering signal %d (%s) failed: %m\n", sig, strsignal(sig));
-            return 1;
-        }
-    }
+    int forward_signals_count = 0;
+    int* forward_signals = NULL;
+    char** first_child_argv = argv + argc;
 
-    sigset_t set;
-    sigfillset(&set);
-    sigprocmask(SIG_BLOCK, &set, 0);
-
+    /* parse command line arguments */
+    char* arg;
     for (int i = 1; i < argc; ++i) {
-        if (argv[i][0] == '-') {
-            if (argv[i][1] != '\0' && argv[i][2] == '\0') {
-                switch (argv[i][1]) {
-                    case 'a':
-                        conf.watch_all_children = 1;
-                        break;
+        arg = argv[i];
+        if (arg[0] == '-') {
+            if (arg[1] != '\0' && arg[2] == '\0') {
+                switch (arg[1]) {
                     case 'h':
-                        print_usage(argv[0]);
+                        print_usage(argv[0], 1);
                         return 0;
+                    case 'k': {
+                        ++i;
+                        if (!argv[i] || argv[i][0] == '\0') {
+                            fprintf(stderr, "no termination step list given\n");
+                            print_usage(argv[0], 0);
+                            return 1;
+                        }
+                        if (read_signals_array(argv[i], &conf.termination_signals_count, &conf.termination_signals)) {
+                            return 1;
+                        }
+                        break;
+                    }
+                    case 's': {
+                        ++i;
+                        if (!argv[i] || argv[i][0] == '\0') {
+                            fprintf(stderr, "no signals to forward given\n");
+                            print_usage(argv[0], 0);
+                            return 1;
+                        }
+                        if (read_signals_array(argv[i], &forward_signals_count, &forward_signals)) {
+                            return 1;
+                        }
+                        break;
+                    }
                     case 't':
                         ++i;
-                        conf.timeout = atoi(argv[i]);
-                        if (conf.timeout <= 0) {
-                            fprintf(stderr, "invalid timeout %s\n", argv[i]);
+                        if (!argv[i] || argv[i][0] == '\0') {
+                            fprintf(stderr, "no timeout given\n");
+                            print_usage(argv[0], 0);
+                            return 1;
+                        }
+                        conf.timeout = strtol(argv[i], &arg, 10);
+                        if (!arg || arg[0] != '\0' || conf.timeout < 0) {
+                            fprintf(stderr, "invalid timeout: %s\n", argv[i]);
                             return 1;
                         }
                         break;
                     default:
-                        fprintf(stderr, "unexpected argument %s\n", argv[i]);
-                        print_usage(argv[0]);
+                        fprintf(stderr, "unexpected argument %s\n", arg);
+                        print_usage(argv[0], 0);
                         return 1;
                 }
                 continue;
-            } else if (argv[i][1] == '-' && argv[i][2] == '-' && argv[i][3] == '\0') {
-                spawn_children(argc - i - 1, &argv[i + 1]);
+            } else if (arg[1] == '-' && arg[2] == '-' && arg[3] == '\0') {
+                first_child_argv = argv + i + 1;
                 break;
             }
         }
-        fprintf(stderr, "unexpected argument %s\n", argv[i]);
-        print_usage(argv[0]);
+        fprintf(stderr, "unexpected argument %s\n", arg);
+        print_usage(argv[0], 0);
         return 1;
     }
 
-    if (conf.children_count < 1) {
-        fprintf(stderr, "no children spawned, exiting\n");
+    /* default termination signal sequence */
+    if (!conf.termination_signals_count) {
+        conf.termination_signals_count = 2;
+        conf.termination_signals = malloc(conf.termination_signals_count * sizeof(int));
+        if (!conf.termination_signals) {
+            fprintf(stderr, "can't allocate memory: %m\n");
+            return 1;
+        }
+        conf.termination_signals[0] = SIGTERM;
+        conf.termination_signals[1] = SIGKILL;
+    }
+
+    /* default signals to forward */
+    if (!forward_signals_count) {
+        forward_signals_count = 1;
+        forward_signals = malloc(forward_signals_count * sizeof(int));
+        if (!forward_signals) {
+            fprintf(stderr, "can't allocate memory: %m\n");
+            return 1;
+        }
+        forward_signals[0] = SIGINT;
+    }
+
+    /* block signals during signal handler registration and child spawning */
+    sigprocmask(SIG_BLOCK, &conf.set, 0);
+
+    /* register signals to forward */
+    for (int i = 0; i < forward_signals_count; ++i) {
+        if (register_signal_handler(forward_signals[i])) {
+            return 1;
+        }
+    }
+    free(forward_signals); /* not needed anymore */
+
+    /* SIGALRM needed for termination stages */
+    if (register_signal_handler(SIGALRM)) {
         return 1;
     }
 
-    sigprocmask(SIG_UNBLOCK, &set, 0);
+    /* SIGTERM starts termination chain */
+    if (register_signal_handler(SIGTERM)) {
+        return 1;
+    }
+
+    /* get and test procfs-file to read children from */
+    const char* proc_children_format = "/proc/%d/task/%d/children";
+    int n = snprintf(NULL, 0, proc_children_format, pid, pid);
+    if (n >= 0) {
+        conf.proc_children_path = malloc(n * sizeof(char));
+        if (!conf.proc_children_path) {
+            fprintf(stderr, "can't allocate memory: %m\n");
+            return 1;
+        }
+        n = snprintf(conf.proc_children_path, n + 1, proc_children_format, pid, pid);
+    }
+    if (n < 0) {
+        fprintf(stderr, "snprintf failed: %m\n");
+        return 1;
+    }
+    FILE* f = fopen(conf.proc_children_path, "r");
+    if (!f) {
+        fprintf(stderr, "can't open `%s': %m\n", conf.proc_children_path);
+        return 1;
+    }
+    fclose(f);
+
+    /* everything ok so far, now spawn the children */
+    if (!spawn_children(first_child_argv)) {
+        fprintf(stderr, "no children to spawn\n");
+        return 1;
+    }
+
+    /* unblock signals after signal handler registration and child spawning */
+    sigprocmask(SIG_UNBLOCK, &conf.set, 0);
 
     int rc = 0;
     int stat;
@@ -256,7 +419,9 @@ int main(int argc, char* argv[]) {
             } else {
                 debug("wait: other error: %m\n");
                 rc = 1;
-                terminate_children(2);
+                if (!conf.termination_stage) {
+                    terminate_children();
+                }
             }
         } else if (pid > 0 && (WIFEXITED(stat) | WIFSIGNALED(stat))) {
             int child_rc;
@@ -266,30 +431,16 @@ int main(int argc, char* argv[]) {
                 child_rc = WEXITSTATUS(stat);
             }
             debug("process %d exited with %d\n", pid, child_rc);
-            if (child_rc) {
+            if (!rc) {
                 rc = child_rc;
             }
-            int i;
-            for (i = 0; i < conf.children_count; ++i) {
-                if (conf.children[i] == pid) {
-                    break;
-                }
-            }
-            if (i < conf.children_count) {
-                conf.children[i] = -conf.children[i];
-                --conf.children_alive;
-                if (conf.children_alive <= 0) {
-                    debug("no child left, exiting\n");
-                    break;
-                }
-                terminate_children(0);
-            } else if (conf.watch_all_children) {
-                terminate_children(0);
+            if (!conf.termination_stage) {
+                terminate_children();
             }
         }
     }
 
-    free(conf.children);
+    free(conf.proc_children_path);
 
     return rc;
 }
